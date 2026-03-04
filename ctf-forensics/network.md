@@ -13,6 +13,8 @@
 - [USB HID Stenography/Chord PCAP (UTCTF 2024)](#usb-hid-stenographychord-pcap-utctf-2024)
 - [BCD Encoding in UDP (VuwCTF 2025)](#bcd-encoding-in-udp-vuwctf-2025)
 - [HTTP File Upload Exfiltration in PCAP (MetaCTF 2026)](#http-file-upload-exfiltration-in-pcap-metactf-2026)
+- [Packet Interval Timing-Based Encoding (EHAX 2026)](#packet-interval-timing-based-encoding-ehax-2026)
+- [USB HID Mouse/Pen Drawing Recovery (EHAX 2026)](#usb-hid-mousepen-drawing-recovery-ehax-2026)
 - [NTLMv2 Hash Cracking from PCAP (Pragyan 2026)](#ntlmv2-hash-cracking-from-pcap-pragyan-2026)
 
 ---
@@ -286,6 +288,138 @@ tshark -r capture.pcap -q -z "follow,tcp,ascii,1"
 - "Dead drop" pattern: attacker uploads file to web server for later retrieval
 
 **Lesson:** Always start with `--export-objects` to extract transferred files before deep packet analysis. The flag is often in the exfiltrated file itself.
+
+---
+
+## Packet Interval Timing-Based Encoding (EHAX 2026)
+
+**Pattern (Breathing Void):** Large PCAPNG with millions of packets, but only a few hundred on one interface carry data. The signal is in the **timing gaps** between identical packets, not their content.
+
+**Identification:** Challenge mentions "breathing", "void", "silence", or timing. PCAP has many interfaces but only one has interesting traffic. Packets are identical but spaced at two distinct intervals.
+
+**Decoding workflow:**
+```python
+from scapy.all import rdpcap
+
+packets = rdpcap('challenge.pcapng')
+
+# 1. Filter to the right interface (e.g., interface 2)
+# tshark: tshark -r challenge.pcapng -Y "frame.interface_id == 2" -T fields -e frame.time_epoch
+
+# 2. Compute inter-packet intervals
+times = [float(pkt.time) for pkt in packets if pkt.sniffed_on == 'interface_2']
+intervals = [times[i+1] - times[i] for i in range(len(times)-1)]
+
+# 3. Identify binary mapping (two distinct interval values)
+# E.g., 10ms → 0, 100ms → 1 (threshold at ~50ms)
+threshold = 0.05  # 50ms
+bits = [0 if dt < threshold else 1 for dt in intervals]
+
+# 4. May need to prepend a leading 0 bit (first interval has no predecessor)
+bits = [0] + bits
+
+# 5. Convert bits to bytes (MSB-first)
+data = bytes(int(''.join(str(b) for b in bits[i:i+8]), 2)
+             for i in range(0, len(bits) - 7, 8))
+print(data.decode(errors='replace'))
+```
+
+**Key insight:** When identical packets appear on a single interface with only two practical interval values, it's almost certainly binary encoding via timing. The content is noise — the signal is in the gaps. Filter by interface and count unique intervals first.
+
+**Scale tip:** Large PCAPs (millions of packets) often have the signal in a tiny subset. Triage with `tshark -q -z io,phs` to find which interface has the fewest packets — that's likely the data carrier.
+---
+
+## USB HID Mouse/Pen Drawing Recovery (EHAX 2026)
+
+**Pattern (Painter):** PCAP contains USB HID interrupt transfers from a mouse/pen device. Drawing data encoded as relative movements with multiple draw modes.
+
+**Packet format (7-byte HID reports):**
+| Byte | Field | Notes |
+|------|-------|-------|
+| 0 | Button state | 0x01 = pressed (may be constant) |
+| 1 | Mode/pad | 0=hover, 1=draw mode 1, 2=draw mode 2 |
+| 2-3 | dx (int16 LE) | Relative X movement |
+| 4-5 | dy (int16 LE) | Relative Y movement |
+| 6 | Wheel | Usually 0 |
+
+**Extraction and rendering:**
+```python
+import struct
+from PIL import Image, ImageDraw
+
+# Extract HID data
+# tshark -r capture.pcap -Y "usb.transfer_type==1" -T fields -e usb.capdata
+
+packets = []
+with open('hid_data.txt') as f:
+    for line in f:
+        raw = bytes.fromhex(line.strip().replace(':', ''))
+        if len(raw) >= 7:
+            btn = raw[0]
+            mode = raw[1]
+            dx = struct.unpack('<h', raw[2:4])[0]
+            dy = struct.unpack('<h', raw[4:6])[0]
+            packets.append((btn, mode, dx, dy))
+
+# Accumulate positions per mode
+SCALE = 5
+positions = {0: [], 1: [], 2: []}
+x, y = 0, 0
+for btn, mode, dx, dy in packets:
+    x += dx
+    y += dy
+    positions[mode].append((x, y))
+
+# Render each mode separately (different colors = different text layers)
+for mode in [1, 2]:
+    pts = positions[mode]
+    if not pts:
+        continue
+    min_x = min(p[0] for p in pts) - 100
+    min_y = min(p[1] for p in pts) - 100
+    max_x = max(p[0] for p in pts) + 100
+    max_y = max(p[1] for p in pts) + 100
+    w = (max_x - min_x) * SCALE
+    h = (max_y - min_y) * SCALE
+    img = Image.new('RGB', (w, h), 'white')
+    draw = ImageDraw.Draw(img)
+    for i in range(1, len(pts)):
+        x0 = (pts[i-1][0] - min_x) * SCALE
+        y0 = (pts[i-1][1] - min_y) * SCALE
+        x1 = (pts[i][0] - min_x) * SCALE
+        y1 = (pts[i][1] - min_y) * SCALE
+        # Skip long jumps (pen lifts)
+        if abs(pts[i][0]-pts[i-1][0]) < 50 and abs(pts[i][1]-pts[i-1][1]) < 50:
+            draw.line([(x0,y0),(x1,y1)], fill='black', width=3)
+    img.save(f'mode_{mode}.png')
+```
+
+**Key techniques:**
+- **Separate modes:** Different button/mode values draw different text layers — render each independently
+- **Skip pen lifts:** Large dx/dy jumps indicate pen was lifted, not drawn — filter by distance threshold
+- **High resolution:** Scale 5-8x with margins for readable handwriting
+- **Time gradient:** Color points by temporal order (rainbow gradient) to trace stroke direction
+- **Character segmentation:** Group consecutive same-mode points by large X gaps to isolate characters
+
+**Alternative: AWK extraction + SVG rendering (faster pipeline):**
+```bash
+# Extract capdata and convert to signed deltas in one pass
+tshark -r pref.pcap -Y "usb.transfer_type==0x01 && usb.endpoint_address==0x81 && usb.capdata" \
+  -T fields -e usb.capdata > capdata.txt
+
+awk '
+function hexval(c){ return index("0123456789abcdef",tolower(c))-1 }
+function hex2dec(h, n,i){ n=0; for(i=1;i<=length(h);i++) n=n*16+hexval(substr(h,i,1)); return n }
+function s16(u){ return (u>=32768)?u-65536:u }
+{ d=$1; if(length(d)!=14) next
+  btn=hex2dec(substr(d,3,2))
+  x=s16(hex2dec(substr(d,7,2) substr(d,5,2)))
+  y=s16(hex2dec(substr(d,11,2) substr(d,9,2)))
+  print btn, x, y }' capdata.txt > deltas.txt
+```
+Then render with SVG (Python) — filter on pen-down state (button=2), accumulate deltas, flip Y axis, draw strokes between consecutive pen-down points.
+
+**Difference from keyboard HID:** Mouse HID uses relative movements (accumulated), keyboard uses keycodes (direct). Mouse drawing requires rendering; keyboard requires keymap lookup.
 
 ---
 
